@@ -4,15 +4,16 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, Any
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL
 
 logger = logging.getLogger(__name__)
 
 class GeminiProcessor:
     def __init__(self):
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel(GEMINI_MODEL)
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.model_name = GEMINI_MODEL
         logger.info(f"GeminiProcessor initialized with {GEMINI_MODEL}")
     
     async def process_video(self, video_path: str, video_metadata: dict = None, max_retries: int = 3) -> Dict[str, Any]:
@@ -20,6 +21,23 @@ class GeminiProcessor:
         video_file = None
         start_time = time.time()
         last_error = None
+
+        # Check video duration
+        duration = video_metadata.get('duration', 0) if video_metadata else 0
+        if duration > 7200:  # 2 hours = 7200 seconds
+            hours = duration // 3600
+            minutes = (duration % 3600) // 60
+            raise ValueError(
+                f"Видео слишком длинное ({hours}ч {minutes}м). "
+                f"Максимальная длина для обработки: 2 часа."
+            )
+
+        # Determine if we need low resolution for videos between 1-2 hours
+        use_low_resolution = 3600 <= duration <= 7200  # 1 hour to 2 hours
+        if use_low_resolution:
+            logger.info(f"Video duration {duration}s (>{3600}s) - using LOW media resolution")
+        else:
+            logger.info(f"Video duration {duration}s - using default media resolution")
 
         try:
             # Upload video to Gemini
@@ -30,7 +48,7 @@ class GeminiProcessor:
             for attempt in range(max_retries):
                 try:
                     logger.info(f"Analyzing video with Gemini (attempt {attempt + 1}/{max_retries})...")
-                    analysis = await self._analyze_video(video_file, video_metadata)
+                    analysis = await self._analyze_video(video_file, video_metadata, use_low_resolution)
 
                     # Parse result
                     result = self._parse_analysis(analysis, video_path, video_metadata)
@@ -66,31 +84,31 @@ class GeminiProcessor:
     async def _upload_to_gemini(self, video_path: str):
         """Upload video to Gemini Files API"""
         loop = asyncio.get_event_loop()
-        
+
         # Upload file (synchronous operation in executor)
         video_file = await loop.run_in_executor(
             None,
-            lambda: genai.upload_file(path=video_path, display_name=Path(video_path).name)
+            lambda: self.client.files.upload(file=video_path)
         )
-        
+
         logger.info(f"File uploaded: {video_file.uri}")
-        
+
         # Wait for processing
-        while video_file.state.name == "PROCESSING":
+        while video_file.state == "PROCESSING":
             await asyncio.sleep(2)
             video_file = await loop.run_in_executor(
                 None,
-                lambda: genai.get_file(video_file.name)
+                lambda: self.client.files.get(name=video_file.name)
             )
-            logger.info(f"File state: {video_file.state.name}")
-        
-        if video_file.state.name != "ACTIVE":
-            raise Exception(f"File processing failed: {video_file.state.name}")
-        
+            logger.info(f"File state: {video_file.state}")
+
+        if video_file.state != "ACTIVE":
+            raise Exception(f"File processing failed: {video_file.state}")
+
         logger.info("File ready for analysis")
         return video_file
     
-    async def _analyze_video(self, video_file, video_metadata: dict = None) -> str:
+    async def _analyze_video(self, video_file, video_metadata: dict = None, use_low_resolution: bool = False) -> str:
         """Analyze video with Gemini"""
 
         # Include metadata context if available
@@ -131,11 +149,23 @@ class GeminiProcessor:
 
         loop = asyncio.get_event_loop()
 
+        # Configure generation settings with media_resolution
+        config = None
+        if use_low_resolution:
+            config = types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW
+            )
+            logger.info("Using LOW media resolution for video analysis")
+
         # Generate response (synchronous operation in executor)
-        response = await loop.run_in_executor(
-            None,
-            lambda: self.model.generate_content([video_file, prompt])
-        )
+        def generate():
+            return self.client.models.generate_content(
+                model=self.model_name,
+                contents=[video_file, prompt],
+                config=config
+            )
+
+        response = await loop.run_in_executor(None, generate)
 
         return response.text
     
@@ -170,7 +200,7 @@ class GeminiProcessor:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: genai.delete_file(video_file.name)
+                lambda: self.client.files.delete(name=video_file.name)
             )
             logger.info(f"Deleted file from Gemini: {video_file.name}")
         except Exception as e:
@@ -197,7 +227,10 @@ Text to translate:
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: self.model.generate_content(prompt)
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt
+                )
             )
 
             translation = response.text.strip()
@@ -224,20 +257,20 @@ Text to translate:
             loop = asyncio.get_event_loop()
             image_file = await loop.run_in_executor(
                 None,
-                lambda: genai.upload_file(path=image_path, display_name=Path(image_path).name)
+                lambda: self.client.files.upload(file=image_path)
             )
 
             try:
                 # Wait for processing
-                while image_file.state.name == "PROCESSING":
+                while image_file.state == "PROCESSING":
                     await asyncio.sleep(1)
                     image_file = await loop.run_in_executor(
                         None,
-                        lambda: genai.get_file(image_file.name)
+                        lambda: self.client.files.get(name=image_file.name)
                     )
 
-                if image_file.state.name != "ACTIVE":
-                    raise Exception(f"Image processing failed: {image_file.state.name}")
+                if image_file.state != "ACTIVE":
+                    raise Exception(f"Image processing failed: {image_file.state}")
 
                 # Extract and translate text
                 prompt = f"""Analyze this image and:
@@ -250,7 +283,10 @@ If there is no text in the image, respond with "[No text found in image]"."""
 
                 response = await loop.run_in_executor(
                     None,
-                    lambda: self.model.generate_content([image_file, prompt])
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=[image_file, prompt]
+                    )
                 )
 
                 translation = response.text.strip()

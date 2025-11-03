@@ -57,9 +57,10 @@ async def on_raw_reaction_add(payload):
 
     # Check if it's the magic wand emoji
     if emoji_str == '🪄':
-        # Create unique key for this reaction
-        reaction_key = f"{payload.message_id}_{payload.user_id}_{payload.emoji}"
+        # Create unique key for this message (ignore user_id to prevent multiple processing)
+        reaction_key = f"magic_wand_{payload.message_id}"
         if reaction_key in processed_reactions:
+            logger.info(f"Message {payload.message_id} already being processed, ignoring duplicate reaction")
             return
         processed_reactions.add(reaction_key)
 
